@@ -1,0 +1,47 @@
+# Build Folders
+**/bin/
+**/obj/
+**/Debug/
+**/Release/
+
+# User-specific files
+.vs/
+*.user
+*.suo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# ASP.NET Specific
+wwwroot/uploads/
+
+# Rider files
+.idea/
+
+# Test Results
+TestResults/
+*.coverage
+*.coveragexml
+*.testresults
+
+# Logs
+*.log
+
+# Configuration
+appsettings.Development.json
+appsettings.Local.json
+appsettings.*.json
+
+# Dotnet artifacts
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Visual Studio Code settings
+.vscode/
+
+# Others
+*.db
+*.bak
+*.sqlite
