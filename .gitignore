@@ -45,3 +45,4 @@ artifacts/
 *.db
 *.bak
 *.sqlite
+/LegalDocumentAssistant.Api/appsettings.json
