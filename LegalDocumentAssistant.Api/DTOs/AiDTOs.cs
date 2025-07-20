@@ -2,12 +2,36 @@ namespace LegalDocumentAssistant.Api.DTOs;
 
 public record AnalyzeTextRequest(string Text, string AnalysisType);
 
-public record AnalysisResponse(
+// Add these outside the AiService class
+public abstract record AnalysisResponseBase(string Type, int Confidence);
+
+public record RiskAnalysisResponse(
     string Type,
     List<string> Risks,
-    List<string> Suggestions,
+    List<string> Mitigations,
     int Confidence
-);
+) : AnalysisResponseBase(Type, Confidence);
+
+public record ReviewAnalysisResponse(
+    string Type,
+    List<string> Strengths,
+    List<string> Weaknesses,
+    List<string> Recommendations,
+    int Confidence
+) : AnalysisResponseBase(Type, Confidence);
+
+public record AmbiguityAnalysisResponse(
+    string Type,
+    List<string> AmbiguousTerms,
+    List<string> Clarifications,
+    int Confidence
+) : AnalysisResponseBase(Type, Confidence);
+
+public record GenericAnalysisResponse(
+    string Type,
+    List<string> Analysis,
+    int Confidence
+) : AnalysisResponseBase(Type, Confidence);
 
 public record ExtractClausesRequest(string Text);
 

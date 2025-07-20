@@ -1,7 +1,9 @@
 using LegalDocumentAssistant.Api.DTOs;
+using LegalDocumentAssistant.Api.Models;
 using Newtonsoft.Json;
-using System.Text;
 using System.Net.Http.Headers;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace LegalDocumentAssistant.Api.Services;
 
@@ -10,10 +12,10 @@ public class AiService : IAiService
     private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
     private readonly ILogger<AiService> _logger;
-    private readonly string _claudeApiKey;
+    private readonly string _cerebrasApiKey;
     private readonly string _openAiApiKey;
     private readonly string _huggingFaceApiKey;
-    private readonly string _claudeApiUrl;
+    private readonly string _cerebrasApiUrl;
     private readonly string _openAiApiUrl;
     private readonly string _huggingFaceApiUrl;
     private readonly string _huggingFaceModel;
@@ -27,62 +29,59 @@ public class AiService : IAiService
         _logger = logger;
         
         var aiSettings = _configuration.GetSection("AiSettings");
-        _claudeApiKey = aiSettings["ClaudeApiKey"] ?? throw new InvalidOperationException("Claude API key is required");
         _openAiApiKey = aiSettings["OpenAiApiKey"] ?? throw new InvalidOperationException("OpenAI API key is required");
         _huggingFaceApiKey = aiSettings["HuggingFaceApiKey"] ?? throw new InvalidOperationException("HuggingFace API key is required");
-        _claudeApiUrl = aiSettings["ClaudeApiUrl"] ?? "https://api.anthropic.com/v1/messages";
         _openAiApiUrl = aiSettings["OpenAiApiUrl"] ?? "https://api.openai.com/v1/chat/completions";
         _huggingFaceApiUrl = aiSettings["HuggingFaceApiUrl"] ?? "https://api-inference.huggingface.co/models";
         _huggingFaceModel = aiSettings["HuggingFaceModel"] ?? "microsoft/DialoGPT-medium";
         _requestTimeoutSeconds = int.Parse(aiSettings["RequestTimeoutSeconds"] ?? "30");
         _maxRetryAttempts = int.Parse(aiSettings["MaxRetryAttempts"] ?? "3");
-
+        _cerebrasApiKey = aiSettings["CerebrasApiKey"] ?? throw new InvalidOperationException("Cerebras key required");
+        _cerebrasApiUrl = aiSettings["CerebrasApiUrl"] ?? "https://api.cerebras.ai/v1/chat/completions";
         _httpClient.Timeout = TimeSpan.FromSeconds(_requestTimeoutSeconds);
     }
 
-    public async Task<AnalysisResponse> AnalyzeTextAsync(AnalyzeTextRequest request)
+    public async Task<AnalysisResponseBase> AnalyzeTextAsync(AnalyzeTextRequest request)
     {
-        _logger.LogInformation("Starting Claude API analysis for type: {AnalysisType}", request.AnalysisType);
+        _logger.LogInformation("Starting Cerebras API analysis for type: {AnalysisType}", request.AnalysisType);
 
         var prompt = GenerateAnalysisPrompt(request.Text, request.AnalysisType);
-        
-        var claudeRequest = new
+        var cerebrasRequest = new
         {
-            model = "claude-3-haiku-20240307", // Using Haiku for free tier
+            model = "llama3.1-8b",
+                                               // model = "cerebras-llama-4-scout-17b-16e-instruct", // For longer documents (16K context)
             max_tokens = 1000,
-            messages = new[]
-            {
-                new
-                {
-                    role = "user",
-                    content = prompt
-                }
-            }
+            messages = new[] { new { role = "user", content = prompt } }
         };
 
         try
         {
-            var response = await ExecuteWithRetryAsync(async () =>
+            var responseContent = await ExecuteWithRetryAsync(async () =>
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, _claudeApiUrl);
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _claudeApiKey);
-                request.Headers.Add("anthropic-version", "2023-06-01");
-                request.Content = new StringContent(JsonConvert.SerializeObject(claudeRequest), Encoding.UTF8, "application/json");
+                using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _cerebrasApiUrl);
+                httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _cerebrasApiKey);
 
-                var response = await _httpClient.SendAsync(request);
+                // Cerebras requires version header
+                httpRequest.Headers.Add("cerebras-version", "2024-05-01"); // Add this line
+
+                httpRequest.Content = new StringContent(
+                    JsonConvert.SerializeObject(cerebrasRequest),
+                    Encoding.UTF8,
+                    "application/json"
+                );
+
+                var response = await _httpClient.SendAsync(httpRequest);
                 response.EnsureSuccessStatusCode();
-
-                var responseContent = await response.Content.ReadAsStringAsync();
-                return responseContent;
+                return await response.Content.ReadAsStringAsync();
             });
 
-            var claudeResponse = JsonConvert.DeserializeObject<ClaudeApiResponse>(response);
-            return ParseClaudeAnalysisResponse(claudeResponse, request.AnalysisType);
+            var cerebrasResponse = JsonConvert.DeserializeObject<CerebrasApiResponse>(responseContent);
+            return ParseCerebrasResponse(cerebrasResponse, request.AnalysisType);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error calling Claude API for analysis");
-            throw new InvalidOperationException("Failed to analyze text with Claude API", ex);
+            _logger.LogError(ex, "Cerebras API error");
+            throw new InvalidOperationException("Cerebras analysis failed", ex);
         }
     }
 
@@ -260,61 +259,243 @@ public class AiService : IAiService
     {
         return analysisType.ToLower() switch
         {
-            "risk" => $"Analyze this legal text for potential risks and liabilities. Identify specific clauses that could be problematic and suggest improvements:\n\n{text}",
-            "review" => $"Provide a comprehensive review of this legal text. Identify strengths, weaknesses, and areas for improvement:\n\n{text}",
-            "ambiguity" => $"Identify any ambiguous language or unclear terms in this legal text that could lead to disputes:\n\n{text}",
-            _ => $"Analyze this legal text and provide insights about its content, structure, and potential issues:\n\n{text}"
+            "risk" =>
+                $@"Analyze this legal text for risks and liabilities. Return JSON with:
+            {{
+                ""risks"": [""risk description""],
+                ""mitigations"": [""mitigation strategy""],
+                ""confidence"": 0-100
+            }}
+            Text: {text}",
+
+            "review" =>
+                $@"Review this legal text. Return JSON with:
+            {{
+                ""strengths"": [""strength description""],
+                ""weaknesses"": [""weakness description""],
+                ""recommendations"": [""improvement suggestion""],
+                ""confidence"": 0-100
+            }}
+            Text: {text}",
+
+            "ambiguity" =>
+                $@"Identify ambiguous terms. Return JSON with:
+            {{
+                ""ambiguousTerms"": [""term/phrase""],
+                ""clarifications"": [""clear alternative""],
+                ""confidence"": 0-100
+            }}
+            Text: {text}",
+
+            _ =>
+                $@"Analyze this legal text. Return JSON with:
+            {{
+                ""analysis"": [""key insight""],
+                ""confidence"": 0-100
+            }}
+            Text: {text}"
         };
     }
 
-    private AnalysisResponse ParseClaudeAnalysisResponse(ClaudeApiResponse claudeResponse, string analysisType)
+    private AnalysisResponseBase ParseCerebrasResponse(CerebrasApiResponse response, string analysisType)
     {
-        var content = claudeResponse?.Content?.FirstOrDefault()?.Text ?? "";
-        
-        // Parse the response to extract risks and suggestions
-        var risks = new List<string>();
-        var suggestions = new List<string>();
+        if (response?.Choices == null || response.Choices.Length == 0)
+            throw new InvalidOperationException("Invalid Cerebras response");
 
-        // Simple parsing - in production, you might want more sophisticated parsing
-        var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        bool inRisksSection = false;
-        bool inSuggestionsSection = false;
+        var content = response.Choices[0].Message.Content;
 
-        foreach (var line in lines)
+        try
         {
-            var trimmedLine = line.Trim();
-            if (trimmedLine.ToLower().Contains("risk") || trimmedLine.ToLower().Contains("problem"))
+            var jsonStart = content.IndexOf('{');
+            var jsonEnd = content.LastIndexOf('}');
+            if (jsonStart < 0 || jsonEnd < jsonStart)
             {
-                inRisksSection = true;
-                inSuggestionsSection = false;
+                throw new InvalidDataException("No JSON found in response");
             }
-            else if (trimmedLine.ToLower().Contains("suggest") || trimmedLine.ToLower().Contains("recommend"))
-            {
-                inRisksSection = false;
-                inSuggestionsSection = true;
-            }
-            else if (trimmedLine.StartsWith("-") || trimmedLine.StartsWith("•"))
-            {
-                if (inRisksSection)
-                    risks.Add(trimmedLine.Substring(1).Trim());
-                else if (inSuggestionsSection)
-                    suggestions.Add(trimmedLine.Substring(1).Trim());
-            }
-        }
+            var jsonContent = content.Substring(jsonStart, jsonEnd - jsonStart + 1);
 
-        // Fallback if parsing doesn't work well
-        if (!risks.Any())
-        {
-            risks.Add("Analysis completed - see full response for details");
+            return analysisType.ToLower() switch
+            {
+                "risk" => ParseRiskResponse(jsonContent),
+                "review" => ParseReviewResponse(jsonContent),
+                "ambiguity" => ParseAmbiguityResponse(jsonContent),
+                _ => ParseGenericResponse(jsonContent)
+            };
         }
-        if (!suggestions.Any())
+        catch (Exception ex)
         {
-            suggestions.Add("Review the analysis for recommended improvements");
+            _logger.LogError(ex, "JSON parsing failed. Attempting fallback parsing");
+            return ParseFallbackResponse(content, analysisType);
         }
-
-        return new AnalysisResponse(analysisType, risks, suggestions, 85);
+    }
+    private RiskAnalysisResponse ParseRiskResponse(string json)
+    {
+        var result = JsonConvert.DeserializeObject<RiskResult>(json);
+        return new RiskAnalysisResponse(
+            "risk",
+            result.Risks ?? new List<string>(),
+            result.Mitigations ?? new List<string>(),
+            result.Confidence
+        );
     }
 
+    private ReviewAnalysisResponse ParseReviewResponse(string json)
+    {
+        var result = JsonConvert.DeserializeObject<ReviewResult>(json);
+        return new ReviewAnalysisResponse(
+            "review",
+            result.Strengths ?? new List<string>(),
+            result.Weaknesses ?? new List<string>(),
+            result.Recommendations ?? new List<string>(),
+            result.Confidence
+        );
+    }
+
+    private AnalysisResponseBase ParseFallbackResponse(string content, string analysisType)
+    {
+        return analysisType.ToLower() switch
+        {
+            "review" => ParseReviewFromText(content),
+            "risk" => ParseRiskFromText(content),
+            "ambiguity" => ParseAmbiguityFromText(content),
+            _ => new GenericAnalysisResponse("general", new List<string> { content }, 50)
+        };
+    }
+    private ReviewAnalysisResponse ParseReviewFromText(string content)
+    {
+        var strengths = new List<string>();
+        var weaknesses = new List<string>();
+        var recommendations = new List<string>();
+
+        // Extract strengths
+        var strengthSection = ExtractSection(content, "Strengths:");
+        if (strengthSection != null)
+        {
+            strengths = ExtractNumberedItems(strengthSection);
+        }
+
+        // Extract weaknesses
+        var weaknessSection = ExtractSection(content, "Weaknesses:");
+        if (weaknessSection != null)
+        {
+            weaknesses = ExtractNumberedItems(weaknessSection);
+        }
+
+        // Extract recommendations
+        var recSection = ExtractSection(content, "Suggestions for improvement:");
+        if (recSection != null)
+        {
+            recommendations = ExtractNumberedItems(recSection);
+        }
+
+        return new ReviewAnalysisResponse(
+            "review",
+            strengths,
+            weaknesses,
+            recommendations,
+            strengths.Any() || weaknesses.Any() || recommendations.Any() ? 80 : 50
+        );
+    }
+
+    private string ExtractSection(string content, string header)
+    {
+        var start = content.IndexOf(header);
+        if (start < 0) return null;
+
+        var end = content.IndexOf("\n\n", start);
+        if (end < 0) end = content.Length;
+
+        return content.Substring(start, end - start);
+    }
+
+    private List<string> ExtractNumberedItems(string text)
+    {
+        return Regex.Matches(text, @"\d+\.\s+(.+?)(?=\n\d+\.|\n\n|$)", RegexOptions.Singleline)
+                    .Select(m => m.Groups[1].Value.Trim())
+                    .ToList();
+    }
+    private AmbiguityAnalysisResponse ParseAmbiguityResponse(string json)
+    {
+        var result = JsonConvert.DeserializeObject<AmbiguityResult>(json);
+        return new AmbiguityAnalysisResponse(
+            "ambiguity",
+            result.AmbiguousTerms ?? new List<string>(),
+            result.Clarifications ?? new List<string>(),
+            result.Confidence
+        );
+    }
+
+    private GenericAnalysisResponse ParseGenericResponse(string json)
+    {
+        var result = JsonConvert.DeserializeObject<GenericResult>(json);
+        return new GenericAnalysisResponse(
+            "general",
+            result.Analysis ?? new List<string>(),
+            result.Confidence
+        );
+    }
+
+    private RiskAnalysisResponse ParseRiskFromText(string content)
+    {
+        var risks = new List<string>();
+        var mitigations = new List<string>();
+
+        // Extract risks
+        var riskSection = ExtractSection(content, "Risks:");
+        if (riskSection != null)
+        {
+            risks = ExtractNumberedItems(riskSection);
+        }
+
+        // Extract mitigations
+        var mitigationSection = ExtractSection(content, "Mitigations:");
+        if (mitigationSection == null)
+        {
+            mitigationSection = ExtractSection(content, "Suggestions:"); // Fallback
+        }
+        if (mitigationSection != null)
+        {
+            mitigations = ExtractNumberedItems(mitigationSection);
+        }
+
+        return new RiskAnalysisResponse(
+            "risk",
+            risks,
+            mitigations,
+            risks.Any() || mitigations.Any() ? 80 : 50
+        );
+    }
+
+    private AmbiguityAnalysisResponse ParseAmbiguityFromText(string content)
+    {
+        var ambiguousTerms = new List<string>();
+        var clarifications = new List<string>();
+
+        // Extract ambiguous terms
+        var termsSection = ExtractSection(content, "Ambiguous Terms:");
+        if (termsSection != null)
+        {
+            ambiguousTerms = ExtractNumberedItems(termsSection);
+        }
+
+        // Extract clarifications
+        var clarificationsSection = ExtractSection(content, "Clarifications:");
+        if (clarificationsSection == null)
+        {
+            clarificationsSection = ExtractSection(content, "Suggestions:"); // Fallback
+        }
+        if (clarificationsSection != null)
+        {
+            clarifications = ExtractNumberedItems(clarificationsSection);
+        }
+
+        return new AmbiguityAnalysisResponse(
+            "ambiguity",
+            ambiguousTerms,
+            clarifications,
+            ambiguousTerms.Any() || clarifications.Any() ? 80 : 50
+        );
+    }
     private ExplainSimpleResponse ParseOpenAiExplanationResponse(OpenAiApiResponse openAiResponse, string originalText)
     {
         var explanation = openAiResponse?.Choices?.FirstOrDefault()?.Message?.Content ?? "Unable to generate explanation";
@@ -391,17 +572,7 @@ public class AiService : IAiService
         return clauses.Take(6).ToList(); // Limit to 6 clauses
     }
 
-    // API Response Models
-    private class ClaudeApiResponse
-    {
-        public ClaudeContent[]? Content { get; set; }
-    }
-
-    private class ClaudeContent
-    {
-        public string? Text { get; set; }
-    }
-
+    
     private class OpenAiApiResponse
     {
         public OpenAiChoice[]? Choices { get; set; }
@@ -416,4 +587,24 @@ public class AiService : IAiService
     {
         public string? Content { get; set; }
     }
+    // Add these inside the AiService class
+    private class AmbiguityResult
+    {
+        public List<string> AmbiguousTerms { get; set; }
+        public List<string> Clarifications { get; set; }
+        public int Confidence { get; set; }
+    }
+
+    private class GenericResult
+    {
+        public List<string> Analysis { get; set; }
+        public int Confidence { get; set; }
+    }
+
+    // Add this outside the AiService class
+    public record GenericAnalysisResponse(
+        string Type,
+        List<string> Analysis,
+        int Confidence
+    ) : AnalysisResponseBase(Type, Confidence);
 }
