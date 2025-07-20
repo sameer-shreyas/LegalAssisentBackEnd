@@ -1,6 +1,7 @@
 using LegalDocumentAssistant.Api.DTOs;
 using LegalDocumentAssistant.Api.Models;
 using Newtonsoft.Json;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -76,7 +77,7 @@ public class AiService : IAiService
             });
 
             var cerebrasResponse = JsonConvert.DeserializeObject<CerebrasApiResponse>(responseContent);
-            return ParseCerebrasResponse(cerebrasResponse, request.AnalysisType);
+            return ParseAnalyzeCerebrasResponse(cerebrasResponse, request.AnalysisType);
         }
         catch (Exception ex)
         {
@@ -129,54 +130,244 @@ public class AiService : IAiService
         }
     }
 
+    // Parse method using your existing models
+    private ExplainSimpleResponse ParseExplainCerebrasResponse(CerebrasApiResponse response, string originalText)
+    {
+        if (response?.Choices == null || response.Choices.Length == 0)
+            throw new InvalidOperationException("Invalid response from Cerebras API");
+
+        var content = response.Choices[0].Message.Content;
+
+        return new ExplainSimpleResponse(
+            Original: originalText,
+            Simplified: ExtractSimplifiedExplanation(content),
+            KeyPoints: ExtractKeyPoints(content)
+        );
+    }
+    private string ExtractSimplifiedExplanation(string content)
+    {
+        var sb = new StringBuilder();
+        bool inSimplifiedSection = false;
+
+        using (var reader = new StringReader(content))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                var trimmedLine = line.Trim();
+
+                // Detect start of Simplified Explanation
+                if (trimmedLine.Equals("## Simplified Explanation", StringComparison.OrdinalIgnoreCase))
+                {
+                    inSimplifiedSection = true;
+                    continue;
+                }
+
+                // End reading when we hit the next section
+                if (inSimplifiedSection && trimmedLine.StartsWith("## "))
+                    break;
+
+                if (inSimplifiedSection)
+                    sb.AppendLine(trimmedLine);
+            }
+        }
+
+        var result = sb.ToString().Trim();
+        return string.IsNullOrWhiteSpace(result)
+            ? "Simplified explanation not available."
+            : result;
+    }
+
+    private List<string> ExtractKeyPoints(string content)
+    {
+        var keyPoints = new List<string>();
+        bool inKeyPointsSection = false;
+
+        using (var reader = new StringReader(content))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                var trimmedLine = line.Trim();
+
+                // Start reading when we hit the "Key Points" heading
+                if (trimmedLine.Equals("## Key Points", StringComparison.OrdinalIgnoreCase))
+                {
+                    inKeyPointsSection = true;
+                    continue;
+                }
+
+                // Stop reading when we hit the next heading
+                if (inKeyPointsSection && trimmedLine.StartsWith("## "))
+                    break;
+
+                // If we’re inside the section, extract bullet points
+                if (inKeyPointsSection)
+                {
+                    if (trimmedLine.StartsWith("- ") || trimmedLine.StartsWith("* ") || trimmedLine.StartsWith("• "))
+                    {
+                        keyPoints.Add(trimmedLine.Substring(2).Trim());
+                    }
+                    else if (System.Text.RegularExpressions.Regex.IsMatch(trimmedLine, @"^\s*\d+[\.\)]\s+"))
+                    {
+                        var match = System.Text.RegularExpressions.Regex.Match(trimmedLine, @"^\s*\d+[\.\)]\s+(.*)");
+                        if (match.Success)
+                            keyPoints.Add(match.Groups[1].Value.Trim());
+                    }
+                }
+            }
+        }
+
+        // Fallback: get first 3 non-empty sentences
+        if (keyPoints.Count == 0)
+        {
+            var sentences = content.Split(new[] { '.', '!', '?' }, StringSplitOptions.RemoveEmptyEntries)
+                                   .Select(s => s.Trim())
+                                   .Where(s => s.Length > 0)
+                                   .Take(3)
+                                   .ToList();
+
+            return sentences.Count > 0 ? sentences : new List<string> { "Key points not available" };
+        }
+
+        return keyPoints;
+    }
+
+    // Enhanced model fallback with retry
+    private readonly string[] _modelPriorityList = new[]
+    {
+        //"qwen-3-32b",         // Best quality
+        "llama-3.3-70b",      // High quality alternative
+        "llama-3.1-8b"        // Lightweight fallback
+    };
+
     public async Task<ExplainSimpleResponse> ExplainSimpleAsync(ExplainSimpleRequest request)
     {
-        _logger.LogInformation("Starting GPT-4o explanation");
+        Exception lastError = null;
 
-        var openAiRequest = new
+        foreach (var model in _modelPriorityList)
         {
-            model = "gpt-4o-mini", // Using mini for cost efficiency
+            try
+            {
+                _logger.LogInformation($"Attempting legal explanation with model: {model}");
+                return await ExplainWithModelAsync(request, model);
+            }
+            catch (Exception ex) when (IsRetryableError(ex))
+            {
+                _logger.LogWarning($"Model {model} failed, trying fallback. Error: {ex.Message}");
+                lastError = ex;
+            }
+        }
+
+        _logger.LogError(lastError, "All explanation models failed");
+        throw new InvalidOperationException("All explanation models failed", lastError);
+    }
+
+    private async Task<ExplainSimpleResponse> ExplainWithModelAsync(
+        ExplainSimpleRequest request,
+        string model)
+    {
+        var cerebrasRequest = new
+        {
+            model,
             messages = new[]
             {
-                new
-                {
-                    role = "system",
-                    content = "You are a helpful legal assistant that explains complex legal text in simple, everyday language. Your goal is to make legal concepts accessible to non-lawyers. Always provide clear, concise explanations and highlight the key practical implications."
-                },
-                new
-                {
-                    role = "user",
-                    content = $"Please explain this legal text in simple terms that anyone can understand:\n\n{request.Text}\n\nProvide:\n1. A simplified explanation\n2. Key points in bullet format\n3. What this means in practical terms"
-                }
+            new
+            {
+                role = "system",
+                content = "You're a legal assistant explaining complex text in simple terms. " +
+                          "Structure your response with:\n" +
+                          "1. Simplified Explanation\n" +
+                          "2. Key Points (as bullet points)\n" +
+                          "3. Practical Implications\n" +
+                          "Use clear headings for each section."
             },
+            new
+            {
+                role = "user",
+                content = $"Explain this legal text in simple terms:\n\n{request.Text}"
+            }
+        },
             max_tokens = 500,
             temperature = 0.3
         };
 
-        try
+        var response = await ExecuteWithRetryAsync(async () =>
         {
-            var response = await ExecuteWithRetryAsync(async () =>
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _cerebrasApiUrl)
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, _openAiApiUrl);
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _openAiApiKey);
-                request.Content = new StringContent(JsonConvert.SerializeObject(openAiRequest), Encoding.UTF8, "application/json");
+                Headers = { Authorization = new AuthenticationHeaderValue("Bearer", _cerebrasApiKey) },
+                Content = new StringContent(JsonConvert.SerializeObject(cerebrasRequest),
+                            Encoding.UTF8, "application/json")
+            };
 
-                var response = await _httpClient.SendAsync(request);
-                response.EnsureSuccessStatusCode();
+            var response = await _httpClient.SendAsync(httpRequest);
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadAsStringAsync();
+        },
+        maxRetries: _maxRetryAttempts,
+        baseDelayMs: 1000);
 
-                return await response.Content.ReadAsStringAsync();
-            });
-
-            var openAiResponse = JsonConvert.DeserializeObject<OpenAiApiResponse>(response);
-            return ParseOpenAiExplanationResponse(openAiResponse, request.Text);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error calling OpenAI API for explanation");
-            throw new InvalidOperationException("Failed to explain text with OpenAI API", ex);
-        }
+        var cerebrasResponse = JsonConvert.DeserializeObject<CerebrasApiResponse>(response);
+        return ParseExplainCerebrasResponse(cerebrasResponse, request.Text);
     }
 
+    private bool IsRetryableError(Exception ex)
+    {
+        // Network-level errors
+        if (ex is HttpRequestException httpEx)
+        {
+            return httpEx.StatusCode switch
+            {
+                HttpStatusCode.RequestTimeout => true,
+                HttpStatusCode.TooManyRequests => true,
+                HttpStatusCode.InternalServerError => true,
+                HttpStatusCode.BadGateway => true,
+                HttpStatusCode.ServiceUnavailable => true,
+                HttpStatusCode.GatewayTimeout => true,
+                _ => false
+            };
+        }
+
+        // Timeout errors
+        if (ex is TimeoutException)
+            return true;
+
+        // Cerebras API-specific errors
+        if (ex.Message.Contains("model_overloaded", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("model_unavailable", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    private async Task<T> ExecuteWithRetryAsync<T>(
+        Func<Task<T>> action,
+        int maxRetries = 3,
+        int baseDelayMs = 1000)
+    {
+        int attempt = 0;
+        while (true)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex) when (IsRetryableError(ex) && attempt < maxRetries)
+            {
+                attempt++;
+                var delay = TimeSpan.FromMilliseconds(baseDelayMs * Math.Pow(2, attempt));
+                _logger.LogWarning($"Retry attempt {attempt}/{maxRetries} in {delay.TotalSeconds}s");
+                await Task.Delay(delay);
+            }
+        }
+    }
     public async Task<ChatResponse> ChatAsync(ChatRequest request)
     {
         _logger.LogInformation("Starting chat interaction");
@@ -297,7 +488,7 @@ public class AiService : IAiService
         };
     }
 
-    private AnalysisResponseBase ParseCerebrasResponse(CerebrasApiResponse response, string analysisType)
+    private AnalysisResponseBase ParseAnalyzeCerebrasResponse(CerebrasApiResponse response, string analysisType)
     {
         if (response?.Choices == null || response.Choices.Length == 0)
             throw new InvalidOperationException("Invalid Cerebras response");
