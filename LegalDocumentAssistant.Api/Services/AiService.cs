@@ -370,54 +370,63 @@ public class AiService : IAiService
     }
     public async Task<ChatResponse> ChatAsync(ChatRequest request)
     {
-        _logger.LogInformation("Starting chat interaction");
+        _logger.LogInformation("Starting chat interaction using Cerebras");
 
-        var openAiRequest = new
+        // Model fallback strategy: Use 70B for complex docs, 8B for simpler queries
+        var model = request.DocumentText.Length > 5000 ? "llama-3.3-70b" : "llama-3.1-8b";
+
+        var cerebrasRequest = new
         {
-            model = "gpt-4o-mini",
+            model,
             messages = new[]
             {
-                new
-                {
-                    role = "system",
-                    content = "You are an expert legal assistant specializing in contract analysis. You help users understand legal documents, identify risks, and provide practical advice. Always be precise, helpful, and reference specific parts of the document when relevant."
-                },
-                new
-                {
-                    role = "user",
-                    content = $"Based on this legal document:\n\n{request.DocumentText}\n\nUser question: {request.Question}\n\nPlease provide a helpful, specific answer."
-                }
+            new
+            {
+                role = "system",
+                content = "You are an expert legal assistant specializing in contract analysis. " +
+                          "Reference specific document sections in responses. " +
+                          "If a question requires external knowledge, state this explicitly."
             },
+            new
+            {
+                role = "user",
+                content = $"DOCUMENT:\n{request.DocumentText}\n\nQUESTION: {request.Question}"
+            }
+        },
             max_tokens = 800,
-            temperature = 0.4
+            temperature = 0.3,  // Lower for legal accuracy
         };
 
         try
         {
-            var response = await ExecuteWithRetryAsync(async () =>
+            var responseContent = await ExecuteWithRetryAsync(async () =>
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, _openAiApiUrl);
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _openAiApiKey);
-                request.Content = new StringContent(JsonConvert.SerializeObject(openAiRequest), Encoding.UTF8, "application/json");
+                using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _cerebrasApiUrl);
+                httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _cerebrasApiKey);
+                httpRequest.Headers.Add("cerebras-version", "2024-05-01");
 
-                var response = await _httpClient.SendAsync(request);
+                httpRequest.Content = new StringContent(
+                    JsonConvert.SerializeObject(cerebrasRequest),
+                    Encoding.UTF8,
+                    "application/json"
+                );
+
+                var response = await _httpClient.SendAsync(httpRequest);
                 response.EnsureSuccessStatusCode();
-
                 return await response.Content.ReadAsStringAsync();
             });
 
-            var openAiResponse = JsonConvert.DeserializeObject<OpenAiApiResponse>(response);
-            var chatResponse = openAiResponse?.Choices?.FirstOrDefault()?.Message?.Content ?? "I'm sorry, I couldn't process your question.";
-
-            return new ChatResponse(chatResponse, DateTime.UtcNow);
+            var cerebrasResponse = JsonConvert.DeserializeObject<CerebrasApiResponse>(responseContent);
+            var chatContent = cerebrasResponse?.Choices?.FirstOrDefault()?.Message?.Content
+                              ?? "Unable to generate response";
+            return new ChatResponse(chatContent, DateTime.UtcNow);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error in chat interaction");
-            throw new InvalidOperationException("Failed to process chat request", ex);
+            _logger.LogError(ex, "Cerebras chat error");
+            return new ChatResponse("Legal analysis unavailable. Please try simpler query.", DateTime.UtcNow);
         }
     }
-
     private async Task<string> ExecuteWithRetryAsync(Func<Task<string>> operation)
     {
         Exception lastException = null;
