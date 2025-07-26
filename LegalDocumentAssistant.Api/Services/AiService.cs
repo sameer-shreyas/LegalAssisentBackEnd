@@ -1,6 +1,7 @@
 using LegalDocumentAssistant.Api.DTOs;
 using LegalDocumentAssistant.Api.Models;
 using Newtonsoft.Json;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -14,12 +15,9 @@ public class AiService : IAiService
     private readonly IConfiguration _configuration;
     private readonly ILogger<AiService> _logger;
     private readonly string _cerebrasApiKey;
-    private readonly string _openAiApiKey;
     private readonly string _huggingFaceApiKey;
     private readonly string _cerebrasApiUrl;
-    private readonly string _openAiApiUrl;
     private readonly string _huggingFaceApiUrl;
-    private readonly string _huggingFaceModel;
     private readonly int _requestTimeoutSeconds;
     private readonly int _maxRetryAttempts;
 
@@ -30,11 +28,8 @@ public class AiService : IAiService
         _logger = logger;
         
         var aiSettings = _configuration.GetSection("AiSettings");
-        _openAiApiKey = aiSettings["OpenAiApiKey"] ?? throw new InvalidOperationException("OpenAI API key is required");
         _huggingFaceApiKey = aiSettings["HuggingFaceApiKey"] ?? throw new InvalidOperationException("HuggingFace API key is required");
-        _openAiApiUrl = aiSettings["OpenAiApiUrl"] ?? "https://api.openai.com/v1/chat/completions";
         _huggingFaceApiUrl = aiSettings["HuggingFaceApiUrl"] ?? "https://api-inference.huggingface.co/models";
-        _huggingFaceModel = aiSettings["HuggingFaceModel"] ?? "microsoft/DialoGPT-medium";
         _requestTimeoutSeconds = int.Parse(aiSettings["RequestTimeoutSeconds"] ?? "30");
         _maxRetryAttempts = int.Parse(aiSettings["MaxRetryAttempts"] ?? "3");
         _cerebrasApiKey = aiSettings["CerebrasApiKey"] ?? throw new InvalidOperationException("Cerebras key required");
@@ -130,7 +125,6 @@ public class AiService : IAiService
         }
     }
 
-    // Parse method using your existing models
     private ExplainSimpleResponse ParseExplainCerebrasResponse(CerebrasApiResponse response, string originalText)
     {
         if (response?.Choices == null || response.Choices.Length == 0)
@@ -368,12 +362,71 @@ public class AiService : IAiService
             }
         }
     }
+
+    private List<string> ChunkDocument(string text, int maxChunkLength = 1500)
+    {
+        var sentences = Regex.Split(text, @"(?<=[.!?])\s+");
+        var chunks = new List<string>();
+        var currentChunk = new StringBuilder();
+
+        foreach (var sentence in sentences)
+        {
+            if (currentChunk.Length + sentence.Length > maxChunkLength && currentChunk.Length > 0)
+            {
+                chunks.Add(currentChunk.ToString());
+                currentChunk.Clear();
+            }
+
+            currentChunk.Append(sentence).Append(' ');
+        }
+
+        if (currentChunk.Length > 0)
+            chunks.Add(currentChunk.ToString());
+
+        return chunks;
+    }
+
+    private double CosineSimilarity(float[] vec1, float[] vec2)
+    {
+        float dot = 0, norm1 = 0, norm2 = 0;
+        for (int i = 0; i < vec1.Length; i++)
+        {
+            dot += vec1[i] * vec2[i];
+            norm1 += vec1[i] * vec1[i];
+            norm2 += vec2[i] * vec2[i];
+        }
+
+        return dot / (Math.Sqrt(norm1) * Math.Sqrt(norm2));
+    }
+
     public async Task<ChatResponse> ChatAsync(ChatRequest request)
     {
-        _logger.LogInformation("Starting chat interaction using Cerebras");
+        _logger.LogInformation("Starting RAG-based chat");
+        var chunks = ChunkDocument(request.DocumentText);
 
-        // Model fallback strategy: Use 70B for complex docs, 8B for simpler queries
-        var model = request.DocumentText.Length > 5000 ? "llama-3.3-70b" : "llama-3.1-8b";
+        var questionEmbedding = await EmbeddingService.Instance.GetEmbeddingAsync(request.Question);
+
+        var chunkScores = new ConcurrentBag<(string Chunk, double Score)>();
+        var options = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Environment.ProcessorCount * 2
+        };
+
+        await Parallel.ForEachAsync(chunks, options, async (chunk, ct) =>
+        {
+            var embedding = await EmbeddingService.Instance.GetEmbeddingAsync(chunk);
+            var similarity = CosineSimilarity(questionEmbedding, embedding);
+            chunkScores.Add((chunk, similarity));
+        });
+
+        var topChunks = chunkScores
+            .OrderByDescending(x => x.Score)
+            .Take(3)
+            .Select(x => x.Chunk)
+            .ToList();
+
+        var condensedContext = string.Join("\n\n---\n\n", topChunks);
+        var model = condensedContext.Length > 5000 ? "llama-3.3-70b" : "llama-3.1-8b";
 
         var cerebrasRequest = new
         {
@@ -390,11 +443,11 @@ public class AiService : IAiService
             new
             {
                 role = "user",
-                content = $"DOCUMENT:\n{request.DocumentText}\n\nQUESTION: {request.Question}"
+                content = $"CONTEXT:\n{condensedContext}\n\nQUESTION: {request.Question}"
             }
         },
             max_tokens = 800,
-            temperature = 0.3,  // Lower for legal accuracy
+            temperature = 0.3
         };
 
         try
@@ -423,8 +476,8 @@ public class AiService : IAiService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Cerebras chat error");
-            return new ChatResponse("Legal analysis unavailable. Please try simpler query.", DateTime.UtcNow);
+            _logger.LogError(ex, "RAG chat error");
+            return new ChatResponse("Legal analysis unavailable due to document size. Try a smaller section.", DateTime.UtcNow);
         }
     }
     private async Task<string> ExecuteWithRetryAsync(Func<Task<string>> operation)
@@ -696,32 +749,6 @@ public class AiService : IAiService
             ambiguousTerms.Any() || clarifications.Any() ? 80 : 50
         );
     }
-    private ExplainSimpleResponse ParseOpenAiExplanationResponse(OpenAiApiResponse openAiResponse, string originalText)
-    {
-        var explanation = openAiResponse?.Choices?.FirstOrDefault()?.Message?.Content ?? "Unable to generate explanation";
-        
-        // Extract key points from the explanation
-        var keyPoints = new List<string>();
-        var lines = explanation.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        
-        foreach (var line in lines)
-        {
-            if (line.Trim().StartsWith("-") || line.Trim().StartsWith("•") || line.Trim().StartsWith("*"))
-            {
-                keyPoints.Add(line.Trim().Substring(1).Trim());
-            }
-        }
-
-        if (!keyPoints.Any())
-        {
-            keyPoints.Add("This text contains important legal terms and conditions");
-            keyPoints.Add("It establishes rights and obligations for the parties involved");
-            keyPoints.Add("Consider consulting with a legal professional for specific advice");
-        }
-
-        return new ExplainSimpleResponse(originalText, explanation, keyPoints);
-    }
-
     private List<ClauseDto> ExtractClausesFromText(string text)
     {
         var clauses = new List<ClauseDto>();
@@ -772,22 +799,6 @@ public class AiService : IAiService
         return clauses.Take(6).ToList(); // Limit to 6 clauses
     }
 
-    
-    private class OpenAiApiResponse
-    {
-        public OpenAiChoice[]? Choices { get; set; }
-    }
-
-    private class OpenAiChoice
-    {
-        public OpenAiMessage? Message { get; set; }
-    }
-
-    private class OpenAiMessage
-    {
-        public string? Content { get; set; }
-    }
-    // Add these inside the AiService class
     private class AmbiguityResult
     {
         public List<string> AmbiguousTerms { get; set; }
@@ -801,7 +812,6 @@ public class AiService : IAiService
         public int Confidence { get; set; }
     }
 
-    // Add this outside the AiService class
     public record GenericAnalysisResponse(
         string Type,
         List<string> Analysis,
