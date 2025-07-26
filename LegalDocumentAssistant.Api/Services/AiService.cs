@@ -1,6 +1,7 @@
 using LegalDocumentAssistant.Api.DTOs;
 using LegalDocumentAssistant.Api.Models;
 using Newtonsoft.Json;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -368,12 +369,71 @@ public class AiService : IAiService
             }
         }
     }
+
+    private List<string> ChunkDocument(string text, int maxChunkLength = 1500)
+    {
+        var sentences = Regex.Split(text, @"(?<=[.!?])\s+");
+        var chunks = new List<string>();
+        var currentChunk = new StringBuilder();
+
+        foreach (var sentence in sentences)
+        {
+            if (currentChunk.Length + sentence.Length > maxChunkLength && currentChunk.Length > 0)
+            {
+                chunks.Add(currentChunk.ToString());
+                currentChunk.Clear();
+            }
+
+            currentChunk.Append(sentence).Append(' ');
+        }
+
+        if (currentChunk.Length > 0)
+            chunks.Add(currentChunk.ToString());
+
+        return chunks;
+    }
+
+    private double CosineSimilarity(float[] vec1, float[] vec2)
+    {
+        float dot = 0, norm1 = 0, norm2 = 0;
+        for (int i = 0; i < vec1.Length; i++)
+        {
+            dot += vec1[i] * vec2[i];
+            norm1 += vec1[i] * vec1[i];
+            norm2 += vec2[i] * vec2[i];
+        }
+
+        return dot / (Math.Sqrt(norm1) * Math.Sqrt(norm2));
+    }
+
     public async Task<ChatResponse> ChatAsync(ChatRequest request)
     {
-        _logger.LogInformation("Starting chat interaction using Cerebras");
+        _logger.LogInformation("Starting RAG-based chat");
+        var chunks = ChunkDocument(request.DocumentText);
 
-        // Model fallback strategy: Use 70B for complex docs, 8B for simpler queries
-        var model = request.DocumentText.Length > 5000 ? "llama-3.3-70b" : "llama-3.1-8b";
+        var questionEmbedding = await EmbeddingService.Instance.GetEmbeddingAsync(request.Question);
+
+        var chunkScores = new ConcurrentBag<(string Chunk, double Score)>();
+        var options = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Environment.ProcessorCount * 2
+        };
+
+        await Parallel.ForEachAsync(chunks, options, async (chunk, ct) =>
+        {
+            var embedding = await EmbeddingService.Instance.GetEmbeddingAsync(chunk);
+            var similarity = CosineSimilarity(questionEmbedding, embedding);
+            chunkScores.Add((chunk, similarity));
+        });
+
+        var topChunks = chunkScores
+            .OrderByDescending(x => x.Score)
+            .Take(3)
+            .Select(x => x.Chunk)
+            .ToList();
+
+        var condensedContext = string.Join("\n\n---\n\n", topChunks);
+        var model = condensedContext.Length > 5000 ? "llama-3.3-70b" : "llama-3.1-8b";
 
         var cerebrasRequest = new
         {
@@ -390,11 +450,11 @@ public class AiService : IAiService
             new
             {
                 role = "user",
-                content = $"DOCUMENT:\n{request.DocumentText}\n\nQUESTION: {request.Question}"
+                content = $"CONTEXT:\n{condensedContext}\n\nQUESTION: {request.Question}"
             }
         },
             max_tokens = 800,
-            temperature = 0.3,  // Lower for legal accuracy
+            temperature = 0.3
         };
 
         try
@@ -423,8 +483,8 @@ public class AiService : IAiService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Cerebras chat error");
-            return new ChatResponse("Legal analysis unavailable. Please try simpler query.", DateTime.UtcNow);
+            _logger.LogError(ex, "RAG chat error");
+            return new ChatResponse("Legal analysis unavailable due to document size. Try a smaller section.", DateTime.UtcNow);
         }
     }
     private async Task<string> ExecuteWithRetryAsync(Func<Task<string>> operation)
