@@ -95,6 +95,11 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler("/error");
+}
+
 //app.UseHttpsRedirection();
 app.UseCors("AllowLocalhost5173"); // ? Important: Add BEFORE UseAuthorization()
 app.UseAuthentication();
