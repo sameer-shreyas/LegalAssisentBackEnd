@@ -109,6 +109,7 @@ app.UseAuthorization();
 app.UseStaticFiles();
 
 app.MapControllers();
+app.MapGet("/health", () => "Healthy");
 
 // Ensure database is created
 using (var scope = app.Services.CreateScope())
