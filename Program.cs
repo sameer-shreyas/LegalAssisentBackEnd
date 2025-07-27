@@ -66,14 +66,17 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 // Configure CORS
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowLocalhost5173", policy =>
+    options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins("http://localhost:5173")
+        policy.WithOrigins(
+                "http://localhost:5173",
+                "https://legaldocumentai.netlify.app")
               .AllowAnyHeader()
               .AllowAnyMethod()
-              .AllowCredentials(); // Only if using cookies
+              .AllowCredentials(); // Use only if cookies/auth needed
     });
 });
+
 
 // Register services
 builder.Services.AddScoped<IAuthService, AuthService>();
@@ -101,7 +104,7 @@ if (!app.Environment.IsDevelopment())
 }
 
 //app.UseHttpsRedirection();
-app.UseCors("AllowLocalhost5173"); // ? Important: Add BEFORE UseAuthorization()
+app.UseCors("AllowFrontend");
 app.UseAuthentication();
 app.UseAuthorization();
 
